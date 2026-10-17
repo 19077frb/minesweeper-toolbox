@@ -1,0 +1,15 @@
+[project]
+name = "minesweeper-toolbox"
+version = "0.1.0"
+description = "Minesweeper toolbox for replay organization, uploads, GSC scoring and CSV merging"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ms-toollib==1.5.20",
+    "pandas>=3.0.6",
+]
+
+[dependency-groups]
+dev = [
+    "xdis>=6.3.0",
+]

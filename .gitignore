@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.uv-cache/
+metadata.sqlite3
+metadata.sqlite3-*
+settings.json
+upload_settings.json
+upload_history.sqlite3*
+upload_reports/
+parser-reference/
+gsc_reference/
+gsc_settings.json
+app_settings.json
+csv_merge_settings.json
+.settings-*.tmp
+data/
+
+# Local development tools and tests
+/tools/
+/tests/
