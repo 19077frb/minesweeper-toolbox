@@ -7,7 +7,7 @@ DATA_DIR = PROJECT_ROOT / 'data'
 # Only application-owned runtime files; never scan or move replay inputs.
 LEGACY_DATA_NAMES = (
     'settings.json', 'app_settings.json', 'upload_settings.json',
-    'gsc_settings.json', 'csv_merge_settings.json', 'confirmed_completed.json',
+    'competition_settings.json', 'csv_merge_settings.json', 'confirmed_completed.json',
     'metadata.sqlite3', 'metadata.sqlite3-wal', 'metadata.sqlite3-shm',
     'metadata.sqlite3-journal', 'upload_history.sqlite3',
     'upload_history.sqlite3-wal', 'upload_history.sqlite3-shm',

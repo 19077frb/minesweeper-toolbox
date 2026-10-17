@@ -1,14 +1,11 @@
-"""Golden Sheep Cup selection and scores; reference: GSC_calc_1.0.4.exe.
-Reconstructed get_sorted_data/calc_grid rules, without executing the executable.
-"""
+"""Competition replay selection and configurable TopX scoring."""
 import configparser
 import csv
 import hashlib
-from services.gsc_display import render_html
+from plugins.competition.display import render_html
 import json
 import math
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -16,11 +13,11 @@ from fractions import Fraction
 from pathlib import Path
 from common.paths import PROJECT_ROOT
 
-from common.core import parse_avf, Cancelled
-from services.engine import copy_replay
+from common.core import parse_avf, read_avf_recorded_at, Cancelled
+from common.replay_files import copy_replay, export_flat_collections
+from .rules import DEFAULT_TOP_COUNTS, normalize_counts, validate_name
 
 BASE = PROJECT_ROOT
-COUNTS = {'Beg': 20, 'Int': 12, 'Exp': 5}
 BV_LIMITS = {'Beg': 10, 'Int': 30, 'Exp': 100}
 SELECTION_BV_LIMITS = {'Beg': 0, 'Int': 30, 'Exp': 100}
 TIME_PADDING = {'Beg': 10, 'Int': 60, 'Exp': 240}
@@ -49,13 +46,13 @@ def parse_datetime(text):
     return value
 
 
-def validate(inputs, output, edition, start, end, suffix, baseline, time_basis):
+def validate(inputs, output, competition_name, start, end, suffix, baseline, time_basis, top_counts=None):
     if not inputs or any(not Path(p).is_dir() for p in inputs):
         raise ValueError('请添加有效的输入文件夹')
     if not str(output).strip():
         raise ValueError('请选择输出文件夹')
-    if not re.fullmatch(r'[0-9]{1,4}', str(edition).strip()) or int(edition) < 1:
-        raise ValueError('金羊杯届数应为1–9999的整数')
+    validate_name(competition_name)
+    normalize_counts(top_counts)
     start, end = parse_datetime(start), parse_datetime(end)
     if start > end:
         raise ValueError('开始时间不能晚于结束时间')
@@ -63,7 +60,7 @@ def validate(inputs, output, edition, start, end, suffix, baseline, time_basis):
         raise ValueError('请输入录像内标识的后缀')
     if time_basis not in ('recorded', 'modified'):
         raise ValueError('无效的时间依据')
-    for level in COUNTS:
+    for level in DEFAULT_TOP_COUNTS:
         if len(baseline[level]) != 3 or any(not math.isfinite(float(v)) or float(v) <= 0 for v in baseline[level]):
             raise ValueError('NT20.5基准必须为正数')
     output = Path(output).resolve()
@@ -73,9 +70,10 @@ def validate(inputs, output, edition, start, end, suffix, baseline, time_basis):
     return roots, output, start, end
 
 
-def rank_and_score(records, baseline):
+def rank_and_score(records, baseline, top_counts=None):
+    counts = normalize_counts(top_counts)
     rankings, scores = {}, {}
-    for level, n in COUNTS.items():
+    for level, n in counts.items():
         selected = [v for v in records if v['replay'].level == level]
         candidates = [v for v in selected if v['replay'].bv >= BV_LIMITS[level]]
         totals, averages = {}, {}
@@ -89,37 +87,42 @@ def rank_and_score(records, baseline):
             values = [v['replay'].cs / 100 if metric == 'time' else
                       v['replay'].bv * 100 / v['replay'].cs if metric == 'bvs' else v['replay'].stnb for v in top]
             # Original clear_data pads missing slots with 10/60/240 seconds,
-            # and zero bvs/stnb. Denominators remain fixed at 20/12/5.
+            # and zero bvs/stnb. Denominators use the configured Top counts.
             total = math.fsum(values) + (n - len(top)) * (TIME_PADDING[level] if metric == 'time' else 0)
             totals[metric], averages[metric] = total, total / n
         scores[level] = dict(selected=len(selected), available=len(candidates), required=n, complete=len(candidates) >= n,
                              totals=totals, averages=averages)
     ep = baseline['Exp'][1] * baseline['Exp'][2] / baseline['Exp'][0]
     points = {}
-    for level in COUNTS:
+    for level in counts:
         a = scores[level]['averages']
         raw = a['bvs'] * a['stnb'] / a['time'] if a['time'] else 0
         norm = baseline[level][1] * baseline[level][2] / baseline[level][0]
         points[level] = raw / norm * ep if level != 'Exp' else raw
         scores[level]['points'] = points[level]
-    combined = dict(T37=sum(s['totals']['time'] for s in scores.values()),
-                    B37=sum(s['totals']['bvs'] for s in scores.values()),
-                    PPP37=(points['Beg'] * points['Int'] * points['Exp']) ** (1 / 3),
-                    complete=all(s['complete'] for s in scores.values()))
+    total_count = sum(counts.values())
+    combined = {f'T{total_count}': sum(s['totals']['time'] for s in scores.values()),
+                f'B{total_count}': sum(s['totals']['bvs'] for s in scores.values()),
+                f'PPP{total_count}': (points['Beg'] * points['Int'] * points['Exp']) ** (1 / 3),
+                'complete': all(s['complete'] for s in scores.values())}
     return rankings, scores, combined
 
 
-def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=True,
-            check_completion=False, time_basis='recorded', baseline=None, workers=4):
+def run_competition(inputs, output, competition_name, start, end, suffix, emit, stop, recursive=True,
+            check_completion=False, time_basis='recorded', baseline=None, workers=4, flat_export=False,
+            top_counts=None):
     baseline = baseline or reference_settings()['baseline']
-    roots, output, begin, finish = validate(inputs, output, edition, start, end, suffix, baseline, time_basis)
+    counts = normalize_counts(top_counts)
+    competition_name = validate_name(competition_name)
+    roots, output, begin, finish = validate(inputs, output, competition_name, start, end, suffix, baseline, time_basis, counts)
     suffix = suffix.strip()
-    dest = output / f'金羊杯{int(edition)}' / datetime.now().strftime('计算_%Y%m%d_%H%M%S_%f')
+    dest = output / competition_name / f'{competition_name}_{datetime.now():%Y%m%d_%H%M%S_%f}'
     dest.mkdir(parents=True)
     started = time.monotonic()
-    stats = dict(total=0, processed=0, matched=0, duplicates=0, outside_time=0,
+    stats = dict(total=0, processed=0, parsed=0, matched=0, duplicates=0, outside_time=0,
                  wrong_suffix=0, low_bv=0, beginner_below10=0, unverified=0, unsupported=0, failed=0,
-                 selected_copied=0, top_total=0, top_copied=0, warnings=0)
+                 selected_copied=0, top_total=0, top_copied=0, warnings=0,
+                 flat_total=0, flat_copied=0, flat_checked=0)
     warnings, records, top_report, selected_report = [], [], [], []
     scores, combined = {}, {}
     status = 'failed'
@@ -129,7 +132,7 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
             raise Cancelled()
 
     def progress(phase):
-        emit('gsc_progress', dict(stats, phase=phase, directory=str(dest), seconds=time.monotonic() - started))
+        emit('competition_progress', dict(stats, flat_export=flat_export, phase=phase, directory=str(dest), seconds=time.monotonic() - started))
 
     def warn(message):
         warnings.append(message)
@@ -173,11 +176,20 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
 
         def parse(path):
             try:
-                r = parse_avf(path, check_completion=check_completion)
-                at = parse_datetime(r.recorded_at) if time_basis == 'recorded' else datetime.fromtimestamp(path.stat().st_mtime)
+                check()
+                at = (parse_datetime(read_avf_recorded_at(path)) if time_basis == 'recorded'
+                      else datetime.fromtimestamp(path.stat().st_mtime))
+                if not begin <= at.replace(microsecond=0) <= finish:
+                    return path, None, at, None
+                check()
+                r = parse_avf(path, check_completion=False)
+                if (check_completion and r.level in counts and r.player.endswith(suffix)
+                        and r.bv >= SELECTION_BV_LIMITS[r.level]):
+                    check()
+                    r = parse_avf(path, check_completion=True)
                 return path, r, at, None
             except BaseException as ex:
-                if isinstance(ex, (KeyboardInterrupt, SystemExit)):
+                if isinstance(ex, (KeyboardInterrupt, SystemExit, Cancelled)):
                     raise
                 return path, None, None, str(ex)
 
@@ -190,10 +202,10 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
                     if error:
                         stats['failed'] += 1
                         warn(f'{path}: {error}')
-                    elif r.level not in COUNTS:
-                        stats['unsupported'] += 1
-                    elif not begin <= at.replace(microsecond=0) <= finish:
+                    elif r is None:
                         stats['outside_time'] += 1
+                    elif r.level not in counts:
+                        stats['unsupported'] += 1
                     elif not r.player.endswith(suffix):
                         stats['wrong_suffix'] += 1
                     elif r.bv < SELECTION_BV_LIMITS[r.level]:
@@ -211,14 +223,16 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
                             stats['matched'] += 1
                             if r.level == 'Beg' and r.bv < 10:
                                 stats['beginner_below10'] += 1
+                    if r is not None:
+                        stats['parsed'] += 1
                     if stats['processed'] % 64 == 0 or time.monotonic() - tick > .2:
                         progress('筛选参赛录像')
                         tick = time.monotonic()
-        rankings, scores, combined = rank_and_score(records, baseline)
+        rankings, scores, combined = rank_and_score(records, baseline, counts)
         stats['top_total'] = sum(len(v) for v in rankings.values())
         for level, s in scores.items():
             if not s['complete']:
-                warn(f'{level} 仅 {s["available"]} 份有效录像，不足 Top{s["required"]}；按原工具补位规则生成暂定成绩')
+                warn(f'{level} 仅 {s["available"]} 份有效录像，不足 Top{s["required"]}；按补位规则生成暂定成绩')
         if not records:
             warn('没有符合筛选条件的参赛录像')
 
@@ -253,6 +267,11 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
                 top_report.append(row)
                 stats['top_copied'] += int(row['status'] == 'copied')
                 progress('复制 TopX')
+        if flat_export:
+            collections = {Path('参赛录像'): [(v['path'], v['replay'], v['digest']) for v in records],
+                           Path('TopX'): [(v['path'], v['replay'], v['digest'])
+                                          for items in rankings.values() for v in items]}
+            export_flat_collections(collections, dest, stats, check, warn, progress)
         status = 'completed'
     except Cancelled:
         status = 'cancelled'
@@ -268,12 +287,14 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
             total=s['totals'][m], average=s['averages'][m], complete=s['complete'])
             for level, s in scores.items() for m in METRICS]
         write_csv('成绩.csv', score_rows, ['level', 'metric', 'required', 'available', 'total', 'average', 'complete'])
-        combined_rows = [dict(item={'Beg': 'BPP20', 'Int': 'IPP12', 'Exp': 'EPP5'}[level],
+        combined_rows = [dict(item={'Beg': 'BPP', 'Int': 'IPP', 'Exp': 'EPP'}[level] + str(counts[level]),
                              value=s['points']) for level, s in scores.items()]
         combined_rows += [dict(item=k, value=v) for k, v in combined.items() if k != 'complete']
         write_csv('综合成绩.csv', combined_rows, ['item', 'value'])
-        summary = dict(stats, status=status, edition=int(edition), start=begin.isoformat(), end=finish.isoformat(),
-            suffix=suffix, time_basis=time_basis, check_completion=check_completion, bv_limits=BV_LIMITS,
+        summary = dict(stats, status=status, competition_name=competition_name, top_counts=counts,
+            start=begin.isoformat(), end=finish.isoformat(),
+            suffix=suffix, time_basis=time_basis, check_completion=check_completion,
+            flat_export=flat_export, bv_limits=BV_LIMITS,
             selection_bv_limits=SELECTION_BV_LIMITS,
             baseline=baseline, scores=scores, combined=combined, seconds=time.monotonic() - started)
         (dest / '成绩.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -281,6 +302,6 @@ def run_gsc(inputs, output, edition, start, end, suffix, emit, stop, recursive=T
         page = render_html(display_result)
         (dest / '成绩.html').write_text(page, encoding='utf-8')
         (dest / 'warnings.txt').write_text('\n'.join(warnings), encoding='utf-8-sig')
-        emit('gsc_scores', display_result)
+        emit('competition_scores', display_result)
         progress({'completed': '完成', 'cancelled': '已取消', 'failed': '失败'}[status])
     return dest, summary

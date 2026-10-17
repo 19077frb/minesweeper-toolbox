@@ -44,8 +44,7 @@ class Replay:
         return f'{self.level}_{self.style}_{self.cs / 100:06.2f}_3BV={self.bv}_3BVs={speed}_STNB={stnb}_{player}.avf'
 
 
-def parse_avf(path: Path, check_completion=True) -> Replay:
-    d = path.read_bytes()
+def _avf_header(d):
     if len(d) < 30 or d[5] not in (3, 4, 5, 6):
         raise ValueError('无效或不支持的 AVF 文件头')
     mode = d[5] - 2
@@ -55,14 +54,18 @@ def parse_avf(path: Path, check_completion=True) -> Replay:
         mines = int.from_bytes(d[8:10], 'big')
         offset = 10
     offset += mines * 2
+    return mode, offset
+
+
+def _avf_match(d, mode):
     pat = rb'\[' + str(mode - 1).encode() + rb'\|([^\]]{1,180})\|B(\d+)T(\d+\.\d+)\]'
-    match = re.search(pat, d[offset:offset + 4096])
+    match = re.search(pat, d)
     if not match:
         raise ValueError('未找到完整时间/3BV 信息（可能是失败录像）')
-    cs = int((Decimal(match[3].decode()) - 1) * 100)
-    bv = int(match[2])
-    if cs <= 0 or bv <= 0:
-        raise ValueError('时间或 3BV 非正数')
+    return match
+
+
+def _avf_timestamp(match):
     stamp = match[1].split(b'|')[0].decode('ascii', errors='replace')
     dt = re.match(r'(\d{1,2})\.(\d{1,2})\.(\d{4})\.', stamp)
     if not dt:
@@ -71,11 +74,31 @@ def parse_avf(path: Path, check_completion=True) -> Replay:
     clock = re.match(r'\d{1,2}\.\d{1,2}\.\d{4}\.(\d{1,2}):(\d{1,2}):(\d{1,2})(?::(\d+))?', stamp)
     recorded_at = ''
     if clock:
-        # Arbiter's four-digit subsecond field contains an extra leading digit;
-        # retain the final three milliseconds, as its timestamp reader does.
+        # Arbiter stores an extra leading digit; retain the final milliseconds.
         ms_part = int((clock[4] or '0')[-3:])
         recorded_at = datetime(int(dt[3]), int(dt[2]), int(dt[1]), int(clock[1]),
             int(clock[2]), int(clock[3]), ms_part * 1000).isoformat(timespec='milliseconds')
+    return day, recorded_at
+
+
+def read_avf_recorded_at(path: Path) -> str:
+    """Read only the bounded metadata region, without scanning mouse events."""
+    with path.open('rb') as stream:
+        mode, offset = _avf_header(stream.read(30))
+        stream.seek(offset)
+        match = _avf_match(stream.read(4096), mode)
+    return _avf_timestamp(match)[1]
+
+
+def parse_avf(path: Path, check_completion=True) -> Replay:
+    d = path.read_bytes()
+    mode, offset = _avf_header(d)
+    match = _avf_match(d[offset:offset + 4096], mode)
+    cs = int((Decimal(match[3].decode()) - 1) * 100)
+    bv = int(match[2])
+    if cs <= 0 or bv <= 0:
+        raise ValueError('时间或 3BV 非正数')
+    day, recorded_at = _avf_timestamp(match)
     pos = offset + match.end()
     # Identical event alignment and NF/FL criteria to rename.c.
     start = next((i - 2 for i in range(pos + 2, len(d)) if d[i] == 1 and d[i - 1] <= 1), None)

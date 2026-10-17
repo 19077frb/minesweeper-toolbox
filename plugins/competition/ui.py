@@ -6,15 +6,18 @@ import tkinter as tk
 from pathlib import Path
 from common.paths import DATA_DIR
 from tkinter import ttk, filedialog, messagebox
-from services.gsc import run_gsc, reference_settings, validate
+from plugins.competition.scoring import run_competition, reference_settings, validate
 from common.settings_store import AutoSettings
-from services.gsc_display import load_result
-from ui.gsc_scoreboard import ScoreboardView
+from plugins.competition.display import load_result, summary_rows
+from plugins.competition.scoreboard import ScoreboardView
+from .rules import DEFAULT_TOP_COUNTS, MAX_TOP_COUNT, normalize_counts, result_counts, validate_name
+from ui.tutorial import add_tool_header, show_tutorial
+from .tutorial import SECTIONS
 
 BASE = DATA_DIR
 
 
-class GscPanel(ttk.Frame):
+class CompetitionPanel(ttk.Frame):
     def __init__(self, master, parent):
         super().__init__(master)
         self.parent = parent
@@ -25,14 +28,18 @@ class GscPanel(ttk.Frame):
         defaults = reference_settings()
         self.baseline = defaults['baseline']
         self.output = tk.StringVar()
-        self.edition = tk.StringVar()
+        self.competition_name = tk.StringVar()
         self.suffix = tk.StringVar()
         self.start_time = tk.StringVar(value=defaults['start'].replace('/', '-'))
         self.end_time = tk.StringVar(value=defaults['end'].replace('/', '-'))
         self.recursive = tk.BooleanVar(value=True)
         self.check_completion = tk.BooleanVar(value=False)
+        self.flat_export = tk.BooleanVar(value=False)
         self.time_basis = tk.StringVar(value='录像内记录时间')
         self.display_scale = tk.StringVar(value='100')
+        self.top_counts = {level: tk.StringVar(value=str(n)) for level, n in DEFAULT_TOP_COUNTS.items()}
+        self.rules_hint = tk.StringVar()
+        self.top_hint = tk.StringVar()
         self.phase = tk.StringVar(value='等待开始')
         self.counts = tk.StringVar(value='录像 0 / 0    符合条件 0    TopX 0 / 0')
         self.views = ttk.Notebook(self)
@@ -43,6 +50,7 @@ class GscPanel(ttk.Frame):
         self.views.add(records_page, text='成绩记录')
         toolbar = ttk.Frame(records_page)
         toolbar.pack(fill='x', pady=(0,8))
+        ttk.Button(toolbar, text='教程', command=lambda: show_tutorial(self, '赛事录像管理', SECTIONS)).pack(side='right', padx=(8, 0))
         ttk.Button(toolbar, text='打开已有成绩…', command=self.choose_scores).pack(side='left')
         ttk.Button(toolbar, text='查看最近成绩', command=self.open_scores).pack(side='left', padx=8)
         ttk.Label(toolbar, text='显示比例 %').pack(side='left', padx=(12,5))
@@ -51,8 +59,8 @@ class GscPanel(ttk.Frame):
         ttk.Button(toolbar, text='打开HTML报告', command=self.open_html).pack(side='right')
         self.scoreboard = ScoreboardView(records_page, self.display_scale)
         self.scoreboard.pack(fill='both', expand=True)
-        ttk.Label(outer, text='金羊杯文件筛选及成绩计算', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(outer, text='计分规则：初级 Top20 / 3BV ≥ 10    中级 Top12 / 3BV ≥ 30    高级 Top5 / 3BV ≥ 100；FL、NF 合并统计').pack(anchor='w', pady=(4, 8))
+        self.tutorial_button = add_tool_header(outer, self, '赛事录像管理', SECTIONS)
+        ttk.Label(outer, textvariable=self.rules_hint).pack(anchor='w', pady=(4, 8))
         ttk.Label(outer, text='输入文件夹（可多次添加）').pack(anchor='w')
         folders = ttk.Frame(outer)
         folders.pack(fill='x', pady=4)
@@ -68,12 +76,18 @@ class GscPanel(ttk.Frame):
         ttk.Label(path_row, text='输出文件夹').pack(side='left')
         ttk.Entry(path_row, textvariable=self.output).pack(side='left', fill='x', expand=True, padx=8)
         ttk.Button(path_row, text='选择文件夹…', command=self.choose_output).pack(side='left')
-        edition_row = ttk.Frame(outer)
-        edition_row.pack(fill='x', pady=5)
-        ttk.Label(edition_row, text='金羊杯届数').pack(side='left')
-        ttk.Entry(edition_row, textvariable=self.edition, width=8).pack(side='left', padx=8)
-        ttk.Label(edition_row, text='标识后缀（从录像内标识末尾匹配，区分大小写）').pack(side='left', padx=(15, 5))
-        ttk.Entry(edition_row, textvariable=self.suffix, width=24).pack(side='left', fill='x', expand=True)
+        name_row = ttk.Frame(outer)
+        name_row.pack(fill='x', pady=5)
+        ttk.Label(name_row, text='比赛名称').pack(side='left')
+        ttk.Entry(name_row, textvariable=self.competition_name, width=24).pack(side='left', padx=8)
+        ttk.Label(name_row, text='标识后缀（从录像内标识末尾匹配，区分大小写）').pack(side='left', padx=(15, 5))
+        ttk.Entry(name_row, textvariable=self.suffix, width=24).pack(side='left', fill='x', expand=True)
+        top_row = ttk.Frame(outer)
+        top_row.pack(fill='x', pady=5)
+        for level, label in (('Beg','初级 Top'),('Int','中级 Top'),('Exp','高级 Top')):
+            ttk.Label(top_row, text=label).pack(side='left', padx=(0, 5))
+            ttk.Spinbox(top_row, from_=1, to=MAX_TOP_COUNT, width=5,
+                        textvariable=self.top_counts[level]).pack(side='left', padx=(0, 18))
         times = ttk.Frame(outer)
         times.pack(fill='x', pady=5)
         ttk.Label(times, text='开始时间').pack(side='left')
@@ -88,7 +102,9 @@ class GscPanel(ttk.Frame):
         ttk.Label(opts, text='时间依据').pack(side='left')
         ttk.Combobox(opts, textvariable=self.time_basis, values=['录像内记录时间', '文件修改时间（原工具）'],
                      state='readonly', width=23).pack(side='left', padx=8)
-        ttk.Label(outer, text='初级参赛录像不设3BV门槛，BV<10也会原样导出；仅Top20计分要求BV≥10。默认按100%完成度计算。').pack(anchor='w', pady=3)
+        ttk.Checkbutton(outer, text='额外复制 ALL 文件夹（三级别合并，方便批量导入）',
+                        variable=self.flat_export).pack(anchor='w', pady=3)
+        ttk.Label(outer, text='初级参赛录像不设3BV门槛，BV<10也会原样导出；初级计分要求BV≥10。默认按100%完成度计算。').pack(anchor='w', pady=3)
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=7)
         self.go = ttk.Button(controls, text='开始筛选及计算', command=self.start)
@@ -102,33 +118,47 @@ class GscPanel(ttk.Frame):
         self.bar.pack(fill='x', pady=5)
         ttk.Label(outer, textvariable=self.counts, wraplength=1000).pack(anchor='w')
         self.table = ttk.Treeview(outer, columns=('level', 'count', 'time', 'bvs', 'stnb', 'points'), show='headings', height=4)
-        for key, label in zip(self.table['columns'], ('级别', '有效局数/TopX', 'Time平均', '3BV/s平均', 'STNB平均', '综合分')):
+        for key, label in zip(self.table['columns'], ('级别', '有效局数/TopX', 'Time平均/TopX', '3BV/s平均/TopX', 'STNB平均/TopX', 'PPP')):
             self.table.heading(key, text=label)
-            self.table.column(key, width=140, anchor='center')
+            self.table.column(key, width=160 if key in ('time', 'bvs', 'stnb') else 110, anchor='center')
         self.table.pack(fill='x', pady=7)
-        self.combined = tk.StringVar(value='T37 / B37 / PPP37：等待计算（NT20.5基准沿用原工具配置）')
+        ttk.Label(outer, textvariable=self.top_hint,
+                  wraplength=1000).pack(anchor='w')
+        self.combined = tk.StringVar(value='汇总成绩：等待计算（PPP采用NT20.5基准）')
         ttk.Label(outer, textvariable=self.combined, wraplength=1000).pack(anchor='w')
         self.log = tk.Text(outer, height=3, wrap='word', state='disabled', font=('Microsoft YaHei UI', 9))
         self.log.pack(fill='both', expand=True, pady=(6, 0))
         try:
-            config = json.loads((BASE / 'gsc_settings.json').read_text(encoding='utf-8'))
+            config = json.loads((BASE / 'competition_settings.json').read_text(encoding='utf-8'))
             for p in config.get('inputs', []):
                 self.inputs.insert('end', p)
-            for key in ('output', 'edition', 'suffix', 'start_time', 'end_time', 'recursive', 'check_completion', 'time_basis', 'display_scale'):
+            for key in ('output', 'competition_name', 'suffix', 'start_time', 'end_time', 'recursive', 'check_completion', 'time_basis', 'display_scale', 'flat_export'):
                 if key in config:
                     getattr(self, key).set(config[key])
+            for level, value in config.get('top_counts', {}).items():
+                if level in self.top_counts:
+                    self.top_counts[level].set(value)
             self.baseline = config.get('baseline', self.baseline)
         except (OSError, ValueError):
             pass
-        self.settings = AutoSettings(self, BASE / 'gsc_settings.json', self.settings_snapshot, parent.settings_status.set)
-        self.settings.watch(self.input_paths, self.output, self.edition, self.suffix, self.start_time,
-                            self.end_time, self.recursive, self.check_completion, self.time_basis, self.display_scale)
+        self.settings = AutoSettings(self, BASE / 'competition_settings.json', self.settings_snapshot, parent.settings_status.set)
+        self.settings.watch(self.input_paths, self.output, self.competition_name, self.suffix, self.start_time,
+                            self.end_time, self.recursive, self.check_completion, self.time_basis, self.display_scale, self.flat_export, *self.top_counts.values())
+        for variable in self.top_counts.values():
+            variable.trace_add('write', self.update_top_hints)
+        self.update_top_hints()
         self.after(100, self.poll)
+
+    def update_top_hints(self, *args):
+        b, i, e = (self.top_counts[level].get() or '?' for level in DEFAULT_TOP_COUNTS)
+        self.rules_hint.set(f'计分：初级Top{b} / 3BV≥10    中级Top{i} / 3BV≥30    高级Top{e} / 3BV≥100；FL、NF合并统计')
+        self.top_hint.set(f'平均值 / 第X名成绩：初级X={b}、中级X={i}、高级X={e}；Time更小、3BV/s和STNB更大才能提升成绩。')
 
     def settings_snapshot(self):
         return dict(inputs=list(self.inputs.get(0, 'end')), baseline=self.baseline,
-            **{key: getattr(self, key).get() for key in ('output', 'edition', 'suffix', 'start_time',
-                'end_time', 'recursive', 'check_completion', 'time_basis', 'display_scale')})
+            top_counts={level: variable.get() for level, variable in self.top_counts.items()},
+            **{key: getattr(self, key).get() for key in ('output', 'competition_name', 'suffix', 'start_time',
+                'end_time', 'recursive', 'check_completion', 'time_basis', 'display_scale', 'flat_export')})
 
     def add_folder(self):
         if not self.running:
@@ -153,9 +183,10 @@ class GscPanel(ttk.Frame):
             return
         try:
             config = dict(inputs=list(self.inputs.get(0, 'end')), baseline=self.baseline,
-                **{key: getattr(self, key).get() for key in ('output', 'edition', 'suffix', 'start_time', 'end_time', 'recursive', 'check_completion', 'time_basis')})
+                **{key: getattr(self, key).get() for key in ('output', 'competition_name', 'suffix', 'start_time', 'end_time', 'recursive', 'check_completion', 'time_basis', 'flat_export')})
+            config['top_counts'] = normalize_counts({level: var.get() for level, var in self.top_counts.items()})
             basis = 'recorded' if config['time_basis'] == '录像内记录时间' else 'modified'
-            validate(config['inputs'], config['output'], config['edition'], config['start_time'], config['end_time'], config['suffix'], self.baseline, basis)
+            validate(config['inputs'], config['output'], config['competition_name'], config['start_time'], config['end_time'], config['suffix'], self.baseline, basis, config['top_counts'])
             self.settings.flush()
         except (ValueError, OSError, KeyError) as ex:
             messagebox.showerror('配置错误', str(ex), parent=self)
@@ -172,10 +203,11 @@ class GscPanel(ttk.Frame):
         self.bar.start(15)
         def work():
             try:
-                dest, _ = run_gsc(config['inputs'], config['output'], config['edition'],
+                dest, _ = run_competition(config['inputs'], config['output'], config['competition_name'],
                     config['start_time'], config['end_time'], config['suffix'],
                     lambda k, v: self.events.put((k, v)), self.stop,
-                    config['recursive'], config['check_completion'], basis, self.baseline)
+                    config['recursive'], config['check_completion'], basis, self.baseline,
+                    flat_export=config['flat_export'], top_counts=config['top_counts'])
                 self.events.put(('done', str(dest)))
             except Exception as ex:
                 self.events.put(('error', str(ex)))
@@ -190,9 +222,9 @@ class GscPanel(ttk.Frame):
                 break
             if kind == 'log':
                 logs.append(value)
-            elif kind == 'gsc_progress':
+            elif kind == 'competition_progress':
                 progress = value
-            elif kind == 'gsc_scores':
+            elif kind == 'competition_scores':
                 result = value
             else:
                 terminal = (kind, value)
@@ -208,7 +240,9 @@ class GscPanel(ttk.Frame):
             self.latest = s['directory']
             self.phase.set(f"{s['phase']} · 耗时 {s['seconds']:.1f} 秒")
             self.counts.set(f"录像 {s['processed']} / {s['total']}   符合条件 {s['matched']}（已复制 {s['selected_copied']}）   TopX {s['top_copied']} / {s['top_total']}\n"
-                f"初级BV<10仅导出 {s['beginner_below10']}   时间不符 {s['outside_time']}   后缀不符 {s['wrong_suffix']}   中高级3BV不足 {s['low_bv']}   重复 {s['duplicates']}   待核验 {s['unverified']}   无效 {s['failed']}   警告 {s['warnings']}")
+                f"已解析 {s['parsed']}   初级BV<10仅导出 {s['beginner_below10']}   时间不符（已跳过解析）{s['outside_time']}   后缀不符 {s['wrong_suffix']}   中高级3BV不足 {s['low_bv']}   重复 {s['duplicates']}   待核验 {s['unverified']}   无效 {s['failed']}   警告 {s['warnings']}")
+            if s.get('flat_export'):
+                self.counts.set(self.counts.get() + f"\nALL 合集 {s['flat_copied']} / {s['flat_total']}（已处理 {s['flat_checked']}）")
             if s['phase'] != '扫描录像':
                 self.bar.stop()
                 self.bar.configure(mode='determinate')
@@ -216,19 +250,13 @@ class GscPanel(ttk.Frame):
                 if s['phase'] == '复制参赛录像':
                     value = 70 + 15 * s['selected_copied'] / max(1, s['matched'])
                 if s['phase'] == '复制 TopX':
-                    value = 85 + 15 * s['top_copied'] / max(1, s['top_total'])
+                    value = 85 + (10 if s.get('flat_export') else 15) * s['top_copied'] / max(1, s['top_total'])
+                if s['phase'] == '复制 ALL 合集':
+                    value = 95 + 5 * s['flat_checked'] / max(1, s['flat_total'])
                 self.bar['value'] = 100 if s['phase'] == '完成' else value
         if result and result['scores']:
-            self.scoreboard.set_data(result)
+            self.show_summary(result)
             self.views.select(1)
-            self.table.delete(*self.table.get_children())
-            for level, s in result['scores'].items():
-                a = s['averages']
-                self.table.insert('', 'end', values=(level, f"{s['available']}/{s['required']}",
-                    f"{a['time']:.2f}", f"{a['bvs']:.3f}", f"{a['stnb']:.2f}", f"{s['points']:.2f}"))
-            c = result['combined']
-            self.combined.set(f"T37 = {c['T37']:.2f}    B37 = {c['B37']:.3f}    PPP37 = {c['PPP37']:.2f}"
-                              + ('    局数足够' if c['complete'] else '    暂定：部分级别局数不足'))
         if terminal:
             self.running = False
             self.bar.stop()
@@ -240,30 +268,46 @@ class GscPanel(ttk.Frame):
                 self.latest = terminal[1]
         self.after(100, self.poll)
 
+    def show_summary(self, result):
+        self.scoreboard.set_data(result)
+        self.table.delete(*self.table.get_children())
+        for row in summary_rows(result):
+            self.table.insert('', 'end', values=row)
+        c = result['combined']
+        total = sum(result_counts(result).values())
+        self.combined.set(f"T{total} = {c.get(f'T{total}', 0):.2f}    B{total} = {c.get(f'B{total}', 0):.3f}    PPP{total} = {c.get(f'PPP{total}', 0):.2f}"
+                          + ('    局数足够' if c.get('complete') else '    暂定：部分级别局数不足'))
+
     def open_result(self):
         if self.latest and Path(self.latest).is_dir():
             os.startfile(self.latest)
 
     def open_scores(self):
         self.views.select(1)
-        path = Path(self.latest) / '成绩.json' if self.latest else None
+        if not self.output.get().strip():
+            return
+        try:
+            name = validate_name(self.competition_name.get())
+        except ValueError:
+            return
+        root = Path(self.output.get()) / name
+        path = Path(self.latest) / '成绩.json' if self.latest and Path(self.latest).parent == root else None
         if path is None or not path.is_file():
-            root = Path(self.output.get()) / f'金羊杯{self.edition.get()}'
-            paths = sorted(root.glob('计算_*/成绩.json'), reverse=True) if self.output.get() else []
+            paths = sorted((p for p in root.glob('*/成绩.json') if p.parent.name.startswith(name + '_')), reverse=True)
             path = paths[0] if paths else None
         if path:
             self.show_scores(path)
 
     def choose_scores(self):
-        path = filedialog.askopenfilename(parent=self, title='打开金羊杯成绩.json',
-            filetypes=[('金羊杯成绩', '*.json')], initialdir=self.latest or self.output.get() or str(BASE))
+        path = filedialog.askopenfilename(parent=self, title='打开赛事成绩.json',
+            filetypes=[('赛事成绩', '*.json')], initialdir=self.latest or self.output.get() or str(BASE))
         if path:
             self.show_scores(Path(path))
 
     def show_scores(self, path):
         try:
             result = load_result(path)
-            self.scoreboard.set_data(result)
+            self.show_summary(result)
             self.latest = str(path.parent)
             self.views.select(1)
         except (OSError, ValueError, KeyError, TypeError) as ex:

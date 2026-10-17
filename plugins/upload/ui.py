@@ -6,8 +6,10 @@ import tkinter as tk
 from pathlib import Path
 from common.paths import DATA_DIR
 from tkinter import ttk, filedialog, messagebox
-from services.uploader import upload_directory
+from plugins.upload.uploader import upload_directory
 from common.settings_store import AutoSettings
+from ui.tutorial import add_tool_header
+from .tutorial import SECTIONS
 
 BASE = DATA_DIR
 
@@ -20,7 +22,7 @@ class UploadPanel(ttk.Frame):
         self.stop = threading.Event()
         self.events = queue.Queue()
         self.latest = ''
-        self.directory = tk.StringVar(value=parent.latest)
+        self.directory = tk.StringVar(value=parent.get_result('pb_top5'))
         self.username = tk.StringVar()
         self.password = tk.StringVar()
         self.recursive = tk.BooleanVar(value=True)
@@ -29,7 +31,7 @@ class UploadPanel(ttk.Frame):
         self.counts = tk.StringVar(value='录像 0 / 0    上传成功 0    网站已存在 0    跳过 0    失败 0    待确认 0')
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='自动上传录像', style='Title.TLabel').pack(anchor='w')
+        self.tutorial_button = add_tool_header(outer, self, '自动上传录像', SECTIONS)
         ttk.Label(outer, text='上传目标：www.saolei.wang（与旧工具相同的 HTTP 接口；传输未加密）').pack(anchor='w', pady=8)
         ttk.Label(outer, text='只读取 AVF 原始字节，不改内容、不重命名；输入及选项（含账号密码）自动保存到本机 JSON。').pack(anchor='w')
         ttk.Label(outer, text='输入文件夹（上传其中的 AVF 录像）').pack(anchor='w', pady=(16, 5))
@@ -92,8 +94,9 @@ class UploadPanel(ttk.Frame):
     def use_pb_result(self):
         if self.running:
             return
-        if self.parent.latest and Path(self.parent.latest).is_dir():
-            self.directory.set(self.parent.latest)
+        result = self.parent.get_result('pb_top5')
+        if result and Path(result).is_dir():
+            self.directory.set(result)
         else:
             messagebox.showinfo('暂无整理结果', '请先在 PB/TOP5 中完成一次整理，或自行选择输入文件夹。', parent=self)
 

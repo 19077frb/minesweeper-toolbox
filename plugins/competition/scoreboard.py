@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
-from services.gsc_display import build_matrix
+from plugins.competition.display import build_matrix
+from .rules import result_counts
 
 
 class ScoreboardView(ttk.Frame):
@@ -9,8 +10,9 @@ class ScoreboardView(ttk.Frame):
         self.scale_variable = scale_variable
         self.summary = None
         self.cells = []
-        self.caption = tk.StringVar(value='运行金羊杯筛选及计算，或打开已有的成绩.json')
-        self.info = tk.StringVar(value='左侧初级Top20，右上中级Top12，右下高级Top5；t=Time，b=3BV/s，s=STNB')
+        self.caption = tk.StringVar(value='运行赛事录像筛选及计算，或打开已有的成绩.json')
+        self.legend = '左侧初级，右上中级，右下高级；Top数量按赛事设置；t=Time，b=3BV/s，s=STNB'
+        self.info = tk.StringVar(value=self.legend)
         ttk.Label(self, textvariable=self.caption, wraplength=1000).pack(anchor='w', pady=(0,8))
         frame = ttk.Frame(self)
         frame.pack(fill='both',expand=True)
@@ -26,7 +28,7 @@ class ScoreboardView(ttk.Frame):
         self.canvas.bind('<Configure>',lambda e:self.draw())
         self.canvas.bind('<MouseWheel>',self.scroll)
         self.canvas.bind('<Motion>',self.hover)
-        self.canvas.bind('<Leave>',lambda e:self.info.set('t=Time，b=3BV/s，s=STNB；颜色阈值沿用原工具'))
+        self.canvas.bind('<Leave>',lambda e:self.info.set(self.legend))
         ttk.Label(self,textvariable=self.info,wraplength=1000).pack(anchor='w',pady=(7,0))
         scale_variable.trace_add('write',lambda *a:self.draw())
 
@@ -34,7 +36,10 @@ class ScoreboardView(ttk.Frame):
         self.summary = summary
         self.cells = build_matrix(summary)
         enough = '局数足够' if summary.get('combined',{}).get('complete') else '暂定：局数不足，缺项为补位值'
-        self.caption.set(f"金羊杯{summary.get('edition','')} | {summary.get('start','')} 至 {summary.get('end','')} | 后缀 {summary.get('suffix','')} | {enough}")
+        self.caption.set(f"{summary.get('competition_name','赛事')} | {summary.get('start','')} 至 {summary.get('end','')} | 后缀 {summary.get('suffix','')} | {enough}")
+        counts = result_counts(summary)
+        self.legend = f"左侧初级Top{counts['Beg']}，右上中级Top{counts['Int']}，右下高级Top{counts['Exp']}；t=Time，b=3BV/s，s=STNB"
+        self.info.set(self.legend)
         self.canvas.yview_moveto(0)
         self.draw()
 
@@ -51,7 +56,7 @@ class ScoreboardView(ttk.Frame):
             size = 20
         self.row_size = size
         self.column_size = size*3.25
-        width, height = 30*size,29*size
+        width, height = 30*size,(max(c['row'] for c in self.cells)+5)*size
         self.origin_x = max(2*size,(self.canvas.winfo_width()-26*size)/2)
         self.origin_y = 2*size
         self.canvas.configure(scrollregion=(0,0,max(width,self.canvas.winfo_width()),height))

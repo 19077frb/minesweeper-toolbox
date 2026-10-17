@@ -3,7 +3,6 @@ import csv
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,24 +12,14 @@ from pathlib import Path
 from common.paths import DATA_DIR, prepare_data_dir
 
 from common.core import Replay, parse_avf, available_name, Cancelled
+from common.replay_files import copy_replay, export_flat_collections
 
 CACHE_VERSION = '4'
 
 
-def copy_replay(source, target, expected_digest):
-    """Only create a new destination; source is always opened read-only."""
-    digest = hashlib.sha256()
-    with source.open('rb') as reader, target.open('xb') as writer:
-        while chunk := reader.read(1024 * 1024):
-            writer.write(chunk)
-            digest.update(chunk)
-    if digest.digest() != expected_digest:
-        raise OSError('复制期间源录像发生外部变化，副本哈希与扫描时不一致')
-    shutil.copystat(source, target)
-
 
 def run(inputs, output, emit, stop, recursive=True, rename=True, workers=4, cache_path=None,
-        check_completion=False):
+        check_completion=False, flat_export=False):
     started = time.perf_counter()
     output = Path(output).resolve()
     roots = list(dict.fromkeys(Path(p).resolve() for p in inputs))
@@ -49,7 +38,7 @@ def run(inputs, output, emit, stop, recursive=True, rename=True, workers=4, cach
             (dest / category / kind).mkdir(parents=True)
     stats = dict(total=0, processed=0, renamed=0, unchanged=0, failed=0, unverified=0,
                  bv=0, pb=0, pb_copied=0, top_total=0, top_found=0, top_checked=0,
-                 warnings=0, cached=0)
+                 warnings=0, cached=0, flat_total=0, flat_copied=0, flat_checked=0)
     warnings, pb_rows, top_rows, review_rows = [], [], [], []
     if cache_path is None:
         prepare_data_dir()
@@ -71,7 +60,7 @@ def run(inputs, output, emit, stop, recursive=True, rename=True, workers=4, cach
         emit('log', 'WARNING: ' + msg)
 
     def progress(phase):
-        emit('progress', dict(stats, phase=phase, seconds=time.perf_counter() - started, directory=str(dest)))
+        emit('progress', dict(stats, flat_export=flat_export, phase=phase, seconds=time.perf_counter() - started, directory=str(dest)))
 
     def remember(path, r):
         st = path.stat()
@@ -246,6 +235,13 @@ def run(inputs, output, emit, stop, recursive=True, rename=True, workers=4, cach
                 stats['top_checked'] += 1
                 top_rows.append(row)
                 progress('复制 Top5')
+        if flat_export:
+            collections = {Path(cat) / kind: [] for cat in ('FL','NF','ALL') for kind in ('PB','Top5')}
+            for (cat, level, bv), (p, r) in sorted(best.items()):
+                collections[Path(cat) / 'PB'].append((p, r, source_digests[p]))
+            for (cat, level, metric), items in sorted(tops.items()):
+                collections[Path(cat) / 'Top5'].extend((p, r, source_digests[p]) for p, r in items)
+            export_flat_collections(collections, dest, stats, check, warn, progress)
         status = 'completed'
     except Cancelled:
         status = 'cancelled'
@@ -260,7 +256,7 @@ def run(inputs, output, emit, stop, recursive=True, rename=True, workers=4, cach
         csv_report('top5.csv', top_rows, ['category', 'level', 'metric', 'rank', 'bv', 'time', 'bvs', 'stnb', 'source', 'output', 'status'])
         csv_report('needs_review.csv', review_rows, ['path', 'level', 'bv', 'time', 'day', 'status'])
         (dest / 'warnings.txt').write_text('\n'.join(warnings), encoding='utf-8-sig')
-        summary = dict(stats, status=status, check_completion=check_completion,
+        summary = dict(stats, status=status, check_completion=check_completion, flat_export=flat_export,
                        seconds=round(time.perf_counter() - started, 3))
         (dest / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         progress({'completed': '完成', 'cancelled': '已取消', 'failed': '失败'}[status])

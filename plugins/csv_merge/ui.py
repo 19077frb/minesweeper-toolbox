@@ -6,10 +6,13 @@ from pathlib import Path
 from common.paths import PROJECT_ROOT, DATA_DIR
 from tkinter import ttk, filedialog, messagebox
 
-from services.csv_merge import merge_csv, validate
+from plugins.csv_merge.merge import merge_csv, validate
 from common.settings_store import AutoSettings, read_settings
+from ui.tutorial import add_tool_header
+from .tutorial import SECTIONS
 
 BASE = DATA_DIR
+EXCEL_EXTENSIONS = ('.xlsx', '.xlsm', '.xls', '.xlsb')
 
 
 class CsvMergePanel(ttk.Frame):
@@ -20,22 +23,23 @@ class CsvMergePanel(ttk.Frame):
         self.stop = threading.Event()
         self.events = queue.Queue()
         self.latest = ''
+        self.latest_report = ''
         self.output = tk.StringVar()
-        self.deduplicate = tk.BooleanVar(value=True)
-        self.sort = tk.BooleanVar(value=True)
+        self.workbook_path = tk.StringVar()
+        self.backup_dir = tk.StringVar(value='CSV_backup')
         self.encoding = tk.StringVar(value='UTF-8（原工具）')
         self.phase = tk.StringVar(value='等待开始')
         self.counts = tk.StringVar(value='文件 0 / 0    输入 0 行    去重 0 行    输出 0 行')
         self.input_paths = tk.Variable(value=())
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='CSV合并', style='Title.TLabel').pack(anchor='w')
+        self.tutorial_button = add_tool_header(outer, self, 'CSV合并', SECTIONS)
         ttk.Label(outer, text='合并 Arbiter stats_csv；按整行去重，再按 BEG → INT → EXP 和录像时间升序排列。').pack(anchor='w', pady=(5, 16))
         ttk.Label(outer, text='输入 CSV 文件（至少两个，按列表顺序合并）').pack(anchor='w')
         row = ttk.Frame(outer)
         row.pack(fill='x', pady=6)
         self.inputs = tk.Listbox(row, listvariable=self.input_paths, selectmode='extended',
-                                 height=7, font=('Microsoft YaHei UI', 10), relief='flat')
+                                 height=5, font=('Microsoft YaHei UI', 10), relief='flat')
         self.inputs.pack(side='left', fill='x', expand=True)
         actions = ttk.Frame(row)
         actions.pack(side='left', padx=(10, 0))
@@ -46,14 +50,24 @@ class CsvMergePanel(ttk.Frame):
         row.pack(fill='x')
         ttk.Entry(row, textvariable=self.output).pack(side='left', fill='x', expand=True)
         ttk.Button(row, text='选择CSV文件…', command=self.choose_output).pack(side='left', padx=(10, 0))
+        ttk.Label(outer, text='备份文件夹（默认：输出CSV同目录下的CSV_backup）').pack(anchor='w', pady=(12, 5))
+        row = ttk.Frame(outer)
+        row.pack(fill='x')
+        ttk.Entry(row, textvariable=self.backup_dir).pack(side='left', fill='x', expand=True)
+        ttk.Button(row, text='选择文件夹…', command=self.choose_backup_dir).pack(side='left', padx=(10, 0))
+        ttk.Label(outer, text='大表（Excel文件，可直接输入路径）').pack(anchor='w', pady=(12, 5))
+        row = ttk.Frame(outer)
+        row.pack(fill='x')
+        ttk.Entry(row, textvariable=self.workbook_path).pack(side='left', fill='x', expand=True)
+        ttk.Button(row, text='选择Excel文件…', command=self.choose_workbook).pack(side='left', padx=(10, 0))
+        ttk.Button(row, text='打开大表', command=self.open_workbook).pack(side='left', padx=(8, 0))
         opts = ttk.Frame(outer)
         opts.pack(fill='x', pady=16)
-        ttk.Checkbutton(opts, text='整行去重', variable=self.deduplicate).pack(side='left')
-        ttk.Checkbutton(opts, text='按级别、录像时间排序', variable=self.sort).pack(side='left', padx=20)
+        ttk.Label(opts, text='固定执行：整行去重、按级别及录像时间排序').pack(side='left', padx=(0, 20))
         ttk.Label(opts, text='输出编码').pack(side='left')
         ttk.Combobox(opts, textvariable=self.encoding, values=['UTF-8（原工具）', 'UTF-8 BOM（Excel）'],
                      state='readonly', width=22).pack(side='left', padx=8)
-        ttk.Label(outer, text='输出可以与某个输入文件相同。已有输出文件会自动备份，已有备份保留。').pack(anchor='w')
+        ttk.Label(outer, text='合并前将全部输入及已有输出备份到CSV_时间戳子文件夹，保留原文件名；同一文件只备份一次。').pack(anchor='w')
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=14)
         self.go = ttk.Button(controls, text='开始合并', command=self.start)
@@ -61,6 +75,7 @@ class CsvMergePanel(ttk.Frame):
         self.cancel = ttk.Button(controls, text='取消', command=self.stop.set, state='disabled')
         self.cancel.pack(side='left', padx=10)
         ttk.Button(controls, text='打开结果文件夹', command=self.open_result).pack(side='right')
+        ttk.Button(controls, text='打开日志文件夹', command=self.open_reports).pack(side='right', padx=(0, 8))
         ttk.Label(outer, textvariable=self.phase).pack(anchor='w')
         self.bar = ttk.Progressbar(outer, maximum=100)
         self.bar.pack(fill='x', pady=8)
@@ -71,7 +86,7 @@ class CsvMergePanel(ttk.Frame):
         if config:
             for p in config.get('inputs', []):
                 self.inputs.insert('end', p)
-            for key in ('output', 'deduplicate', 'sort', 'encoding'):
+            for key in ('output', 'workbook_path', 'backup_dir', 'encoding'):
                 if key in config:
                     getattr(self, key).set(config[key])
         else:
@@ -82,12 +97,42 @@ class CsvMergePanel(ttk.Frame):
             self.output.set(str(PROJECT_ROOT.parent / 'stats_csv.csv'))
         self.settings = AutoSettings(self, BASE / 'csv_merge_settings.json', self.settings_snapshot,
                                      parent.settings_status.set)
-        self.settings.watch(self.input_paths, self.output, self.deduplicate, self.sort, self.encoding)
+        self.settings.watch(self.input_paths, self.output, self.workbook_path, self.backup_dir, self.encoding)
         self.after(100, self.poll)
 
     def settings_snapshot(self):
         return dict(inputs=list(self.inputs.get(0, 'end')), output=self.output.get(),
-                    deduplicate=self.deduplicate.get(), sort=self.sort.get(), encoding=self.encoding.get())
+                    workbook_path=self.workbook_path.get(), backup_dir=self.backup_dir.get(),
+                    encoding=self.encoding.get())
+
+    def choose_backup_dir(self):
+        if not self.running:
+            path = filedialog.askdirectory(parent=self, title='选择CSV备份文件夹')
+            if path:
+                self.backup_dir.set(path)
+
+    def choose_workbook(self):
+        path = filedialog.askopenfilename(parent=self, title='选择大表（Excel文件）',
+            filetypes=[('Excel工作簿', ' '.join('*' + ext for ext in EXCEL_EXTENSIONS))])
+        if path:
+            self.workbook_path.set(path)
+
+    def open_workbook(self):
+        try:
+            value = self.workbook_path.get().strip().strip('"')
+            if not value:
+                raise ValueError('请先选择或输入大表的Excel文件路径。')
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = PROJECT_ROOT / path
+            if path.suffix.lower() not in EXCEL_EXTENSIONS:
+                raise ValueError('请选择Excel文件（.xlsx、.xlsm、.xls或.xlsb）。')
+            if not path.is_file():
+                raise ValueError('大表文件不存在，请检查路径或重新选择。')
+            self.settings.flush()
+            os.startfile(path)
+        except (OSError, ValueError) as ex:
+            messagebox.showerror('无法打开大表', str(ex), parent=self)
 
     def add_files(self):
         if not self.running:
@@ -114,7 +159,7 @@ class CsvMergePanel(ttk.Frame):
         config = self.settings_snapshot()
         encoding = 'utf-8-sig' if config['encoding'] == 'UTF-8 BOM（Excel）' else 'utf-8'
         try:
-            validate(config['inputs'], config['output'], encoding)
+            validate(config['inputs'], config['output'], encoding, config['backup_dir'])
             self.settings.flush()
         except (ValueError, OSError) as ex:
             messagebox.showerror('配置错误', str(ex), parent=self)
@@ -133,7 +178,7 @@ class CsvMergePanel(ttk.Frame):
             try:
                 output, _ = merge_csv(config['inputs'], config['output'],
                     lambda k, v: self.events.put((k, v)), self.stop,
-                    config['deduplicate'], config['sort'], encoding)
+                    encoding=encoding, backup_dir=config['backup_dir'])
                 self.events.put(('done', str(output)))
             except Exception as ex:
                 self.events.put(('error', str(ex)))
@@ -160,14 +205,17 @@ class CsvMergePanel(ttk.Frame):
         if progress:
             s = progress
             self.latest = s['output']
+            self.latest_report = s['report']
             self.phase.set(f"{s['phase']} · 耗时 {s['seconds']:.1f} 秒")
-            self.counts.set(f"文件 {s['files_read']} / {s['files_total']}    输入 {s['input_rows']:,} 行    去重 {s['duplicates_removed']:,} 行    输出 {s['output_rows']:,} 行（已写入 {s['rows_written']:,}）")
+            self.counts.set(f"备份 {s['backups_completed']} / {s['backups_total']}    文件 {s['files_read']} / {s['files_total']}    输入 {s['input_rows']:,} 行    去重 {s['duplicates_removed']:,} 行    输出 {s['output_rows']:,} 行（已写入 {s['rows_written']:,}）")
             self.bar.stop()
             self.bar.configure(mode='determinate')
-            value = 40 * s['files_read'] / max(1, s['files_total'])
+            value = 15 + 25 * s['files_read'] / max(1, s['files_total'])
+            if s['phase'] == '备份 CSV 文件':
+                value = 15 * s['backups_completed'] / max(1, s['backups_total'])
             if s['phase'] in ('整行去重', '按级别、录像时间排序'):
                 value = 55 if s['phase'] == '整行去重' else 65
-            if s['phase'] in ('写入合并结果', '备份已有输出文件'):
+            if s['phase'] == '写入合并结果':
                 value = 75 + 20 * s['rows_written'] / max(1, s['output_rows'])
             self.bar['value'] = 100 if s['phase'] == '完成' else value
         if terminal:
@@ -184,6 +232,11 @@ class CsvMergePanel(ttk.Frame):
     def open_result(self):
         if self.latest and Path(self.latest).parent.is_dir():
             os.startfile(Path(self.latest).parent)
+
+    def open_reports(self):
+        folder = Path(self.latest_report).parent if self.latest_report else BASE / 'csv_merge_reports'
+        if folder.is_dir():
+            os.startfile(folder)
 
     def cancel_task(self):
         self.stop.set()
